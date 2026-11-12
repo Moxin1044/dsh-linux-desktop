@@ -12,7 +12,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { mkdir, readFile } from 'node:fs/promises'
+import { mkdir, readFile, unlink } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, dirname, basename } from 'node:path'
@@ -101,6 +101,50 @@ const BUTTON_DOWN = { left: '0x40', right: '0x41', middle: '0x42' }
 const BUTTON_UP = { left: '0x80', right: '0x81', middle: '0x82' }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * 指针坐标换算。
+ *
+ * 坑在这里：ydotool 的 `mousemove --absolute` 收的是 **0–65535 的原始 ABS 轴值**，
+ * 不是像素。直接传像素会全部挤到左上角（2600px 只占满范围的 4%），轻则点空，
+ * 重则命中左上角热区把 GNOME 概览拉出来。
+ *
+ * 合成器把 0–65535 线性铺满整个逻辑桌面，而逻辑桌面 = 物理尺寸 / 缩放，
+ * 所以 raw = px / 物理尺寸 × 65535 —— 缩放因子在推导中约掉了，只需要截图尺寸。
+ */
+let screenSize = null
+
+async function getScreenSize({ refresh = false } = {}) {
+  if (screenSize && !refresh) return screenSize
+  // 截一张只为拿尺寸；拿完就删，不留垃圾文件。
+  const probe = await captureScreen(`screen-size-${Date.now()}`)
+  if (!probe.ok || !probe.width) return screenSize
+  screenSize = { width: probe.width, height: probe.height }
+  await unlink(probe.path).catch(() => {})
+  return screenSize
+}
+
+/** 截图坐标（像素）→ ydotool 的原始轴值。 */
+async function toRawAxis(px, py) {
+  const size = await getScreenSize()
+  if (!size) throw new Error('拿不到屏幕尺寸，无法换算指针坐标（截图失败？）')
+  const clamp = (value, max) => Math.min(Math.max(Math.round(value), 0), max)
+  return {
+    x: clamp((px / size.width) * 65535, 65535),
+    y: clamp((py / size.height) * 65535, 65535),
+    size,
+  }
+}
+
+/** 移动指针到截图坐标（像素）。 */
+async function moveTo(px, py) {
+  const raw = await toRawAxis(px, py)
+  if (px < 0 || py < 0 || px >= raw.size.width || py >= raw.size.height) {
+    return { ok: false, message: `坐标 (${px}, ${py}) 超出屏幕范围 ${raw.size.width}x${raw.size.height}` }
+  }
+  const moved = await ydotool(['mousemove', '--absolute', String(raw.x), String(raw.y)])
+  return moved.ok ? { ok: true, raw } : { ok: false, message: moved.stderr }
+}
 
 // ---------------------------------------------------------------------------
 
@@ -234,6 +278,8 @@ export function apply(ctx) {
 
       const interactive = args.interactive === true
       const shot = await captureScreen(args.name, { interactive })
+      // 截图尺寸就是指针换算的基准，顺手刷新缓存（换分辨率/缩放后自动跟上）
+      if (shot.ok && shot.width) screenSize = { width: shot.width, height: shot.height }
       if (!shot.ok) return shot
 
       let final = shot
@@ -300,8 +346,8 @@ export function apply(ctx) {
       const hasPoint = Number.isInteger(args.x) && Number.isInteger(args.y)
 
       if (hasPoint) {
-        const moved = await ydotool(['mousemove', '--absolute', String(args.x), String(args.y)])
-        if (!moved.ok) return { ok: false, message: `移动到 (${args.x}, ${args.y}) 失败：${moved.stderr}` }
+        const moved = await moveTo(args.x, args.y)
+        if (!moved.ok) return { ok: false, message: `移动到 (${args.x}, ${args.y}) 失败：${moved.message}` }
         await sleep(120) // 合成器需要一帧来更新命中测试，立刻点击容易点到上一个位置
       }
 
@@ -334,8 +380,8 @@ export function apply(ctx) {
       render: (_args, value) => [{ type: 'text', text: value.message }],
     },
     async execute(args) {
-      const moved = await ydotool(['mousemove', '--absolute', String(args.x), String(args.y)])
-      if (!moved.ok) return { ok: false, message: `移动失败：${moved.stderr}` }
+      const moved = await moveTo(args.x, args.y)
+      if (!moved.ok) return { ok: false, message: `移动失败：${moved.message}` }
       return { ok: true, message: `光标已移到 (${args.x}, ${args.y})` }
     },
   })))
@@ -367,7 +413,8 @@ export function apply(ctx) {
       }
 
       try {
-        await step(['mousemove', '--absolute', String(args.fromX), String(args.fromY)], '移动到起点')
+        const start = await moveTo(args.fromX, args.fromY)
+        if (!start.ok) throw new Error(`移动到起点失败：${start.message}`)
         await sleep(120)
         await step(['click', BUTTON_DOWN[button] || BUTTON_DOWN.left], '按下')
         // 分几步走：一步跳到终点，很多应用不认这是一次拖拽
@@ -375,7 +422,8 @@ export function apply(ctx) {
         for (let i = 1; i <= steps; i += 1) {
           const x = Math.round(args.fromX + ((args.toX - args.fromX) * i) / steps)
           const y = Math.round(args.fromY + ((args.toY - args.fromY) * i) / steps)
-          await step(['mousemove', '--absolute', String(x), String(y)], '拖动')
+          const hop = await moveTo(x, y)
+          if (!hop.ok) throw new Error(`拖动失败：${hop.message}`)
           await sleep(40)
         }
         await step(['click', BUTTON_UP[button] || BUTTON_UP.left], '松开')
