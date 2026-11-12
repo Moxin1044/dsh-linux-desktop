@@ -1,0 +1,49 @@
+{
+  "name": "dsh-linux-desktop",
+  "version": "0.2.0",
+  "type": "module",
+  "description": "Linux 桌面自动化插件 for DeepSeek Harness：portal 截图 + ydotool 鼠标键盘，GNOME/KDE Wayland 可用",
+  "author": "Moxin1044",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "linux",
+    "wayland",
+    "gnome",
+    "desktop-automation",
+    "screenshot",
+    "ydotool",
+    "uinput"
+  ],
+  "homepage": "https://github.com/Moxin1044/dsh-linux-desktop#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Moxin1044/dsh-linux-desktop.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Moxin1044/dsh-linux-desktop/issues"
+  },
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "files": [
+    "index.js",
+    "portal-shot.py",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT"
+}

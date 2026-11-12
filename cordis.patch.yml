@@ -1,0 +1,5 @@
+# dsh-linux-desktop bundle patch —— 挂载桌面自动化插件
+# 激活方式：dsh plugin --profile web add link:<本目录绝对路径>
+- insert:
+    - id: dsh-linux-desktop
+      name: dsh-linux-desktop
