@@ -1,6 +1,6 @@
 {
   "name": "dsh-linux-desktop",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
   "description": "Linux 桌面自动化插件 for DeepSeek Harness：portal 截图 + ydotool 鼠标键盘，GNOME/KDE Wayland 可用",
   "author": "Moxin1044",

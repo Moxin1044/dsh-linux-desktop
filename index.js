@@ -4,8 +4,10 @@
  * 两条底层路径都是刻意选的，不是随便找了个工具：
  *   截图 → xdg-desktop-portal Screenshot。GNOME Wayland 下 org.gnome.Shell.Screenshot
  *          对普通客户端返回 AccessDenied，grim 要 wlr-screencopy，gnome-screenshot 已退场。
- *   输入 → ydotool，走内核 /dev/uinput。xdotool 只能驱动 XWayland 窗口，原生 Wayland
- *          窗口点不到；uinput 是合成器之下的一层，Wayland 原生窗口同样生效。
+ *   指针 → 自己开 /dev/uinput 建一只绝对定位鼠标（QEMU usb-tablet 模型）。
+ *          ydotool 的虚拟设备只有 EV_REL/EV_KEY，没有 EV_ABS，`--absolute` 事件会被
+ *          内核丢弃；`ydotoold -T` 在本版本又直接退出。自己建设备才能拿到真正的绝对轴。
+ *   键盘 → ydotool（走 /dev/uinput，Wayland 原生窗口同样生效；xdotool 只够 XWayland）。
  *
  * 前提：ydotoold 在跑（systemctl --user enable --now ydotool），用户对 /dev/uinput 有写权限。
  */
@@ -22,6 +24,7 @@ const execFileAsync = promisify(execFile)
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SHOT_SCRIPT = join(HERE, 'portal-shot.py')
+const POINTER_SCRIPT = join(HERE, 'pointer.py')
 const SHOT_DIR = join(homedir(), '.dsh', 'screenshots')
 const YDOTOOL = '/usr/bin/ydotool'
 
@@ -96,9 +99,6 @@ function parseCombo(combo) {
   return codes
 }
 
-const BUTTON_MASK = { left: '0xC0', right: '0xC1', middle: '0xC2' }
-const BUTTON_DOWN = { left: '0x40', right: '0x41', middle: '0x42' }
-const BUTTON_UP = { left: '0x80', right: '0x81', middle: '0x82' }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -124,7 +124,7 @@ async function getScreenSize({ refresh = false } = {}) {
   return screenSize
 }
 
-/** 截图坐标（像素）→ ydotool 的原始轴值。 */
+/** 截图坐标（像素）→ 0–65535 绝对轴值。 */
 async function toRawAxis(px, py) {
   const size = await getScreenSize()
   if (!size) throw new Error('拿不到屏幕尺寸，无法换算指针坐标（截图失败？）')
@@ -136,14 +136,20 @@ async function toRawAxis(px, py) {
   }
 }
 
+/** 执行一串指针动作；全程一个 uinput 设备，拖拽不会中途换设备。 */
+async function pointerActions(actions) {
+  const script = await run('python3', [POINTER_SCRIPT, JSON.stringify(actions)], { timeout: 30000 })
+  return script.ok ? { ok: true } : { ok: false, message: script.stderr }
+}
+
 /** 移动指针到截图坐标（像素）。 */
 async function moveTo(px, py) {
   const raw = await toRawAxis(px, py)
   if (px < 0 || py < 0 || px >= raw.size.width || py >= raw.size.height) {
     return { ok: false, message: `坐标 (${px}, ${py}) 超出屏幕范围 ${raw.size.width}x${raw.size.height}` }
   }
-  const moved = await ydotool(['mousemove', '--absolute', String(raw.x), String(raw.y)])
-  return moved.ok ? { ok: true, raw } : { ok: false, message: moved.stderr }
+  const moved = await pointerActions([{ type: 'move', x: raw.x, y: raw.y, delay: 0.05 }])
+  return moved.ok ? { ok: true, raw } : { ok: false, message: moved.message }
 }
 
 // ---------------------------------------------------------------------------
@@ -344,19 +350,24 @@ export function apply(ctx) {
       const button = args.button || 'left'
       const times = Number.isInteger(args.times) && args.times > 0 ? args.times : 1
       const hasPoint = Number.isInteger(args.x) && Number.isInteger(args.y)
+      const actions = []
 
       if (hasPoint) {
-        const moved = await moveTo(args.x, args.y)
-        if (!moved.ok) return { ok: false, message: `移动到 (${args.x}, ${args.y}) 失败：${moved.message}` }
-        await sleep(120) // 合成器需要一帧来更新命中测试，立刻点击容易点到上一个位置
+        const raw = await toRawAxis(args.x, args.y)
+        if (args.x < 0 || args.y < 0 || args.x >= raw.size.width || args.y >= raw.size.height) {
+          return { ok: false, message: `坐标 (${args.x}, ${args.y}) 超出屏幕范围 ${raw.size.width}x${raw.size.height}` }
+        }
+        // 同一次设备会话里先定位再点击，避免两次建设备之间被别的输入干扰
+        actions.push({ type: 'move', x: raw.x, y: raw.y, delay: 0.15 })
       }
 
-      const clickArgs = ['click']
-      if (times > 1) clickArgs.push('--repeat', String(times))
-      clickArgs.push(BUTTON_MASK[button] || BUTTON_MASK.left)
+      for (let i = 0; i < times; i += 1) {
+        actions.push({ type: 'button', button, action: 'down' })
+        actions.push({ type: 'button', button, action: 'up', delay: i < times - 1 ? 0.08 : 0.03 })
+      }
 
-      const clicked = await ydotool(clickArgs)
-      if (!clicked.ok) return { ok: false, message: `点击失败：${clicked.stderr}` }
+      const clicked = await pointerActions(actions)
+      if (!clicked.ok) return { ok: false, message: `点击失败：${clicked.message}` }
 
       const where = hasPoint ? `(${args.x}, ${args.y})` : '当前光标位置'
       return { ok: true, message: `已在 ${where} ${button === 'left' ? '单击' : button} ${times > 1 ? `${times} 次` : '一次'}` }
@@ -407,29 +418,37 @@ export function apply(ctx) {
     },
     async execute(args) {
       const button = args.button || 'left'
-      const step = async (command, label) => {
-        const result = await ydotool(command)
-        if (!result.ok) throw new Error(`${label}失败：${result.stderr}`)
-      }
+      const actions = []
 
       try {
-        const start = await moveTo(args.fromX, args.fromY)
-        if (!start.ok) throw new Error(`移动到起点失败：${start.message}`)
-        await sleep(120)
-        await step(['click', BUTTON_DOWN[button] || BUTTON_DOWN.left], '按下')
+        const start = await toRawAxis(args.fromX, args.fromY)
+        const end = await toRawAxis(args.toX, args.toY)
+        if (args.fromX < 0 || args.fromY < 0 || args.toX < 0 || args.toY < 0
+          || args.fromX >= start.size.width || args.toX >= start.size.width
+          || args.fromY >= start.size.height || args.toY >= start.size.height) {
+          return { ok: false, message: `拖拽坐标超出屏幕范围 ${start.size.width}x${start.size.height}` }
+        }
+
+        actions.push({ type: 'move', x: start.x, y: start.y, delay: 0.15 })
+        actions.push({ type: 'button', button, action: 'down', delay: 0.08 })
         // 分几步走：一步跳到终点，很多应用不认这是一次拖拽
         const steps = 8
         for (let i = 1; i <= steps; i += 1) {
-          const x = Math.round(args.fromX + ((args.toX - args.fromX) * i) / steps)
-          const y = Math.round(args.fromY + ((args.toY - args.fromY) * i) / steps)
-          const hop = await moveTo(x, y)
-          if (!hop.ok) throw new Error(`拖动失败：${hop.message}`)
-          await sleep(40)
+          const raw = await toRawAxis(
+            Math.round(args.fromX + ((args.toX - args.fromX) * i) / steps),
+            Math.round(args.fromY + ((args.toY - args.fromY) * i) / steps),
+          )
+          actions.push({ type: 'move', x: raw.x, y: raw.y, delay: 0.04 })
         }
-        await step(['click', BUTTON_UP[button] || BUTTON_UP.left], '松开')
+        actions.push({ type: 'button', button, action: 'up', delay: 0.03 })
       } catch (error) {
-        try { await ydotool(['click', BUTTON_UP[button] || BUTTON_UP.left]) } catch { /* 尽力松开 */ }
         return { ok: false, message: error.message }
+      }
+
+      const dragged = await pointerActions(actions)
+      if (!dragged.ok) {
+        // 设备会话已结束，按键状态随之释放，不需要额外补救
+        return { ok: false, message: `拖拽失败：${dragged.message}` }
       }
       return { ok: true, message: `已从 (${args.fromX}, ${args.fromY}) 拖到 (${args.toX}, ${args.toY})` }
     },

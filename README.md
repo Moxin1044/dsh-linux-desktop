@@ -9,7 +9,8 @@
 | 能力 | 用的东西 | 为什么不用别的 |
 |---|---|---|
 | 截图 | `xdg-desktop-portal` 的 `Screenshot` 接口 | GNOME Wayland 下 `org.gnome.Shell.Screenshot` 对普通客户端返回 `AccessDenied`；`grim` 需要 wlr-screencopy（GNOME 不支持）；`gnome-screenshot` 已随 GNOME 45 退场 |
-| 鼠标键盘 | `ydotool`（内核 `/dev/uinput`） | `xdotool` 只能驱动 XWayland 窗口，原生 Wayland 窗口点不到；`uinput` 在合成器之下，Wayland 原生窗口同样生效 |
+| 指针 | 自己开 `/dev/uinput` 建一只绝对定位鼠标（QEMU `usb-tablet` 模型：`EV_ABS` 轴 + 鼠标按键） | `xdotool` 只能驱动 XWayland 窗口；`ydotool` 建出来的虚拟设备**只有 `EV_REL`/`EV_KEY`，没有 `EV_ABS`**，`mousemove --absolute` 的绝对事件被内核直接丢弃（`ydotoold -T` 本该补上，但 1.0.4 启动即退出） |
+| 键盘 | `ydotool`（`EV_KEY`，走 `/dev/uinput`） | 键盘只用相对/按键事件，没有绝对坐标问题；`xdotool` 只够 XWayland |
 
 ## 工具
 
@@ -39,13 +40,15 @@ raw = px / 截图尺寸 × 65535
 ## 依赖
 
 ```sh
-# 输入：ydotoold 常驻，负责往 /dev/uinput 写
+# 键盘：ydotoold 常驻
 systemctl --user enable --now ydotool
 
 # 截图：python3 + PyGObject（GNOME 桌面本来就有），裁剪：ffmpeg
 ```
 
-用户需要对 `/dev/uinput` 有写权限。Arch 的 `ydotool` 包自带 uaccess 规则；其他发行版可能要加 udev 规则或把用户加进 `uinput` 组。
+**用户需要对 `/dev/uinput` 有写权限**——指针和键盘都靠它。Arch 的 `ydotool` 包自带 uaccess 规则；其他发行版可能要加 udev 规则或把用户加进 `uinput` 组。
+
+指针不需要 ydotoold 参与：插件自己在 `pointer.py` 里建设备、发事件、销毁，一次工具调用一个设备会话（拖拽的按下-移动-抬起都在同一个会话里，不会被中途换设备打断）。
 
 ## 安装
 
@@ -77,6 +80,7 @@ dsh plugin --profile web add link:$PWD/dsh-linux-desktop
 
 ## 已知限制
 
+- 指针每次工具调用会新建/销毁一个 uinput 设备，单次调用约多 200ms 开销。
 - `desktop_type` 逐字输入只覆盖 US 布局可打印 ASCII；中文、emoji 一律走剪贴板粘贴。
 - `desktop_key` 的键名是 US 布局表，没有的键名会明确报错，不会瞎按。
 - 桌面处于锁屏时 portal 会拒绝或只拍到锁屏画面。
